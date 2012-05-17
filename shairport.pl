@@ -24,12 +24,11 @@
 #        OTHER DEALINGS IN THE SOFTWARE.
 
 use strict;
+use warnings;
 
 use 5.10.0;
 # For given() { when() { } ... }
 use feature ":5.10";
-
-use constant PORT => 5000;
 
 use Getopt::Long;
 use FindBin;
@@ -43,13 +42,14 @@ use HTTP::Response;
 use URI::Escape;
 use IPC::Open2;
 use Crypt::OpenSSL::RSA;
-use Digest::MD5 qw/md5_hex/;
-use POSIX qw/sys_wait_h setsid/;
+use Digest::MD5 qw(md5 md5_hex);
+use POSIX qw(:sys_wait_h setsid);
 eval "use IO::Socket::INET6;";
 
 my $shairportversion = "0.05";
 
 my $apname = "ShairPort $$ on " . `hostname`;
+my $port = 5002;
 # password - required to connect
 # for no password, set:
 my $password = '';
@@ -71,6 +71,9 @@ my $cliport;
 my $mac;
 # SB volume
 my $volume;
+# custom play and stop program
+my $play_prog;
+my $stop_prog;
 # output debugging information
 my $verbose;
 # where to write PID
@@ -86,6 +89,7 @@ unless (-x $hairtunes_cli) {
 
 GetOptions("a|apname=s" => \$apname,
           "p|password=s"  => \$password,
+          "o|server_port=s" => \$port,
           "i|pipe=s"  => \$pipepath,
           "d" => \$daemon,
           "ao_driver=s" => \$libao_driver,
@@ -96,6 +100,8 @@ GetOptions("a|apname=s" => \$apname,
           "s|squeezebox" => \$squeeze,
           "c|cliport=s" => \$cliport,
           "m|mac=s" => \$mac,
+          "play_prog=s" => \$play_prog,
+          "stop_prog=s" => \$stop_prog,
           "l|volume=s" => \$volume,
           "h|help" => \$help);
 
@@ -107,6 +113,7 @@ sub usage {
           "Options:\n".
           "  -a, --apname=AirPort            Sets AirPort name\n".
           "  -p, --password=secret           Sets password\n",
+          "  -o, --server_port=5002          Sets Port for Avahi/dns-sd/howl\n",
           "  -i, --pipe=pipepath             Sets the path to a named pipe for output\n",
           "      --ao_driver=driver          Sets the ao driver (optional)\n",
           "      --ao_devicename=devicename  Sets the ao device name (optional)\n",
@@ -115,6 +122,8 @@ sub usage {
           "  -c  --cliport=port              Sets the SBS CLI port\n",
           "  -m  --mac=address               Sets the SB target device\n",
           "  -l  --volume=level              Sets the SB volume level (in %)\n",
+          "      --play_prog=cmdline         Program to start on 1st connection\n",
+          "      --stop_prog=cmdline         Program to start on last disconnection\n",
           "  -d                              Daemon mode\n",
           "  -w  --writepid=path             Write PID to this location\n",
           "  -v  --verbose                   Print debugging messages\n",
@@ -159,7 +168,7 @@ if (defined($squeeze) && $squeeze) {
             print "WARN:  Disabling Squeezebox Server integration\n";
             undef $squeeze;
         } else {
-            $players = ( $response =~ m/^player count ([0-9]+)$/ );
+            ( $players ) = ( $response =~ m/^player count ([0-9]+)$/ );
             print $socket "players 0 $players\n";
             $response = <$socket>;
             @details = split( /playerindex%3A/ , $response );
@@ -208,7 +217,7 @@ if (defined($squeeze) && $squeeze) {
 };
 chomp $apname;
 
-my @hw_addr = (0, map { int rand 256 } 1..5);
+my @hw_addr = +(map(ord, split(//, md5($apname))))[0..5];
 
 sub POPE {
     print "Broken pipe\n" if $verbose;
@@ -259,19 +268,25 @@ $SIG{__DIE__} = sub {
 };
 
 $avahi_publish = fork();
+my $pw_clause = (length $password) ? "pw=true" : "pw=false";
 if ($avahi_publish==0) {
     { exec 'avahi-publish-service',
         join('', map { sprintf "%02X", $_ } @hw_addr) . "\@$apname",
         "_raop._tcp",
-         PORT,
-        "tp=UDP","sm=false","sv=false","ek=1","et=0,1","cn=0,1","ch=2","ss=16","sr=44100","pw=false","vn=3","txtvers=1"; };
+         $port,
+        "tp=UDP","sm=false","sv=false","ek=1","et=0,1","cn=0,1","ch=2","ss=16","sr=44100",$pw_clause,"vn=3","txtvers=1"; };
     { exec 'dns-sd', '-R',
         join('', map { sprintf "%02X", $_ } @hw_addr) . "\@$apname",
         "_raop._tcp",
         ".",
-         PORT,
-        "tp=UDP","sm=false","sv=false","ek=1","et=0,1","cn=0,1","ch=2","ss=16","sr=44100","pw=false","vn=3","txtvers=1"; };
-    die "could not run avahi-publish-service nor dns-sd";
+         $port,
+        "tp=UDP","sm=false","sv=false","ek=1","et=0,1","cn=0,1","ch=2","ss=16","sr=44100",$pw_clause,"vn=3","txtvers=1"; };
+    { exec 'mDNSPublish',
+        join('', map { sprintf "%02X", $_ } @hw_addr) . "\@$apname",
+        "_raop._tcp",
+         $port,
+        "tp=UDP","sm=false","sv=false","ek=1","et=0,1","cn=0,1","ch=2","ss=16","sr=44100",$pw_clause,"vn=3","txtvers=1"; };
+    die "could not run avahi-publish-service nor dns-sd nor mDNSPublish";
 }
 
 my $airport_pem = join '', <DATA>;
@@ -283,7 +298,7 @@ my $listen;
         local $SIG{__DIE__};
         $listen = new IO::Socket::INET6(Listen => 1,
                             Domain => AF_INET6,
-                            LocalPort => PORT,
+                            LocalPort => $port,
                             ReuseAddr => 1,
                             Proto => 'tcp');
     };
@@ -295,11 +310,11 @@ my $listen;
     }
 
     $listen ||= new IO::Socket::INET(Listen => 1,
-            LocalPort => PORT,
+            LocalPort => $port,
             ReuseAddr => 1,
             Proto => 'tcp');
 }
-die "Can't listen on port " . PORT . ": $!" unless $listen;
+die "Can't listen on port " . $port . ": $!" unless $listen;
 
 sub ip6bin {
     my $ip = shift;
@@ -429,32 +444,31 @@ sub performSqueezeboxSetup {
                     print "Found favourite '" . $favourites[ $index ] . "' with ID '" . $ids[ $index ] . "' at position $index.\n" if $verbose;
                 }
             }
-            #print "Turning on player... " if $verbose;
-            # For some reason, this one dies...
-            #eval {
-            #    local $SIG{ALRM} = sub { die "Socket Operation Timed Out" };
-            #    print $socket "$mac power 1\n";
-            #    alarm 1;
-            #    $response = <$socket>;
-            #    print "$response\n" if $verbose;
-            #    alarm 0;
-            #};
-            #... even within an eval{} loop?!
 
-            print "Showing message... " if $verbose;
-            print $socket "$mac show line2%3AStarting%20AirPlay duration%3A5 brightness%3ApowerOn font%3Ahuge\n";
+            print "Turning on player (if off)... " if $verbose;
+            print $socket "$mac power 1\n";
+            $response = <$socket>;
+            print "$response\n" if $verbose;
+
+            print "Stopping player (if playing)... " if $verbose;
+            print $socket "$mac stop\n";
+            $response = <$socket>;
+            print "$response\n" if $verbose;
+
+            print "Unmuting player (if muted)... " if $verbose;
+            print $socket "$mac mixer muting 0\n";
             $response = <$socket>;
             print "$response\n" if $verbose;
 
             if( defined( $volume ) ) {
-                print "Setting player volume... " if $verbose;
+                print "Setting player volume to $volume... " if $verbose;
                 print $socket "$mac mixer volume $volume\n";
                 $response = <$socket>;
                 print "$response\n" if $verbose;
             }
 
-            print "Unmuting player... " if $verbose;
-            print $socket "$mac mixer muting 0\n";
+            print "Showing message... " if $verbose;
+            print $socket "$mac show line2%3AStarting%20AirPlay duration%3A5 brightness%3ApowerOn font%3Ahuge\n";
             $response = <$socket>;
             print "$response\n" if $verbose;
 
@@ -462,12 +476,11 @@ sub performSqueezeboxSetup {
                 print "Playing favourite... " if $verbose;
                 my $id = uri_escape( $ids[ $index ] );
                 print $socket "$mac favorites playlist play item_id%3A$id\n";
-                $response = <$socket>;
             } else {
                 print "Resuming play... " if $verbose;
                 print $socket "$mac play\n";
-                $response = <$socket>;
             }
+            $response = <$socket>;
             print "$response\n" if $verbose;
         }
         close( $socket );
@@ -490,6 +503,11 @@ while (1) {
             if (defined($squeeze) && $squeeze) {
                 &performSqueezeboxSetup();
             }
+
+            # the 2nd connection is a player connection
+            if (defined($play_prog) && $sel->count() == 2) {
+                system($play_prog);
+            }
         } else {
             if (eof($fh)) {
                 print "Closed: $fh\n" if $verbose;
@@ -501,6 +519,11 @@ while (1) {
                     eval { kill $conns{$fh}{decoder_pid} };
                 }
                 delete $conns{$fh};
+
+                # 1 connection means no connection
+                if (defined($stop_prog) && $sel->count() == 1) {
+                    system($stop_prog);
+                }
                 next;
             }
             if (exists $conns{$fh}) {
@@ -712,5 +735,5 @@ cJyRM9SJ7OKlGt0FMSdJD5KG0XPIpAVNwgpXXH5MDJg09KHeh0kXo+QA6viFBi21y340NonnEfdf
 17fegFPMwOII8MisYm9ZfT2Z0s5Ro3s5rkt+nvLAdfC/PYPKzTLalpGSwomSNYJcB9HNMlmhkGzc
 1JnLYT4iyUyx6pcZBmCd8bD0iwY/FzcgNDaUmbX9+XDvRA0CgYEAkE7pIPlE71qvfJQgoA9em0gI
 LAuE4Pu13aKiJnfft7hIjbK+5kyb3TysZvoyDnb3HOKvInK7vXbKuU4ISgxB2bB3HcYzQMGsz1qJ
-2gG0N5hvJpzwwhbhXqFKA4zaaSrw622wDniAK5MlIE0tIAKKP4yxNGjoD2QYjhBGuhvkWKaXTyY=
+2gG0N5hvJpzwwhbhXqFKA4zaaSrw622wDniAK5MlIE0tIAKKP4yxNGjoD2QYjhBGuhvkWKY=
 -----END RSA PRIVATE KEY-----

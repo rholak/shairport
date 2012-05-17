@@ -25,11 +25,10 @@
  */
 
 #include <fcntl.h>
+#include <signal.h>
 #include "socketlib.h"
 #include "shairport.h"
-
-#define DONT_USE_HAIRTUNES_MAIN
-#include "hairtunes.c" // couldn't figure out how to allow both mains.
+#include "hairtunes.h"
 
 #ifndef TRUE
 #define TRUE (-1)
@@ -41,6 +40,7 @@
 // TEMP
 
 int kCurrentLogLevel = LOG_INFO;
+int bufferStartFill = -1;
 
 #ifdef _WIN32
 #define DEVNULL "nul"
@@ -52,10 +52,56 @@ int kCurrentLogLevel = LOG_INFO;
 #define HEADER_LOG_LEVEL LOG_DEBUG
 #define AVAHI_LOG_LEVEL LOG_DEBUG
 
+static void handleClient(int pSock, char *pPassword, char *pHWADDR);
+static void writeDataToClient(int pSock, struct shairbuffer *pResponse);
+static int readDataFromClient(int pSock, struct shairbuffer *pClientBuffer);
+
+static int parseMessage(struct connection *pConn,unsigned char *pIpBin, unsigned int pIpBinLen, char *pHWADDR);
+static void propogateCSeq(struct connection *pConn);
+
+static void cleanupBuffers(struct connection *pConnection);
+static void cleanup(struct connection *pConnection);
+
+static int startAvahi(const char *pHwAddr, const char *pServerName, int pPort);
+
+static int getAvailChars(struct shairbuffer *pBuf);
+static void addToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf);
+static void addNToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf, int pNofNewBuf);
+
+static char *getTrimmedMalloc(char *pChar, int pSize, int pEndStr, int pAddNL);
+static char *getTrimmed(char *pChar, int pSize, int pEndStr, int pAddNL, char *pTrimDest);
+
+static void slog(int pLevel, char *pFormat, ...);
+static int isLogEnabledFor(int pLevel);
+
+static void initConnection(struct connection *pConn, struct keyring *pKeys, struct comms *pComms, int pSocket, char *pPassword);
+static void closePipe(int *pPipe);
+static void initBuffer(struct shairbuffer *pBuf, int pNumChars);
+
+static void setKeys(struct keyring *pKeys, char *pIV, char* pAESKey, char *pFmtp);
+static RSA *loadKey(void);
+
+
+static void handle_sigchld(int signo) {
+    int status;
+    waitpid(-1, &status, WNOHANG);
+}
+
 int main(int argc, char **argv)
 {
+  // unfortunately we can't just IGN on non-SysV systems
+  struct sigaction sa;
+  sa.sa_handler = handle_sigchld;
+  sa.sa_flags = 0;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGCHLD, &sa, NULL) < 0) {
+      perror("sigaction");
+      return 1;
+  }
+
   char tHWID[HWID_SIZE] = {0,51,52,53,54,55};
-  char tHWID_Hex[HWID_SIZE * 2];
+  char tHWID_Hex[HWID_SIZE * 2 + 1];
+  memset(tHWID_Hex, 0, sizeof(tHWID_Hex));
 
   char tServerName[56] = "ShairPort";
   char tPassword[56] = "";
@@ -95,6 +141,15 @@ int main(int argc, char **argv)
     {
       tPort = atoi(arg+14);
     }
+    else if(!strcmp(arg, "-b")) 
+    {
+      bufferStartFill = atoi(*++argv);
+      argc--;
+    }
+    else if(!strncmp(arg, "--buffer=", 9))
+    {
+      bufferStartFill = atoi(arg + 9);
+    }
     else if(!strcmp(arg, "-k"))
     {
       tUseKnownHWID = TRUE;
@@ -126,13 +181,19 @@ int main(int argc, char **argv)
       slog(LOG_INFO, "Usage:\nshairport [OPTION...]\n\nOptions:\n");
       slog(LOG_INFO, "  -a, --apname=AirPort    Sets Airport name\n");
       slog(LOG_INFO, "  -p, --password=secret   Sets Password (not working)\n");
-      slog(LOG_INFO, "  -o, --server_port=5000  Sets Port for Avahi/dns-sd\n");
+      slog(LOG_INFO, "  -o, --server_port=5002  Sets Port for Avahi/dns-sd/howl\n");
+      slog(LOG_INFO, "  -b, --buffer=282        Sets Number of frames to buffer before beginning playback\n");
       slog(LOG_INFO, "  -d                      Daemon mode\n");
       slog(LOG_INFO, "  -q, --quiet             Supresses all output.\n");
       slog(LOG_INFO, "  -v,-v2,-v3,-vv          Various debugging levels\n");
       slog(LOG_INFO, "\n");
       return 0;
     }    
+  }
+
+  if ( bufferStartFill < 30 || bufferStartFill > BUFFER_FRAMES ) {
+     fprintf(stderr, "buffer value must be > 30 and < %d\n", BUFFER_FRAMES);
+     return(0);
   }
 
   if(tDaemonize)
@@ -159,7 +220,7 @@ int main(int argc, char **argv)
       dup(tIdx);
     }
   }
-  srand ( time(NULL) );
+  srandom ( time(NULL) );
   // Copy over empty 00's
   //tPrintHWID[tIdx] = tAddr[0];
 
@@ -244,7 +305,7 @@ int main(int argc, char **argv)
   return 0;
 }
 
-int findEnd(char *tReadBuf)
+static int findEnd(char *tReadBuf)
 {
   // find \n\n, \r\n\r\n, or \r\r is found
   int tIdx = 0;
@@ -282,7 +343,7 @@ int findEnd(char *tReadBuf)
   return -1;
 }
 
-void handleClient(int pSock, char *pPassword, char *pHWADDR)
+static void handleClient(int pSock, char *pPassword, char *pHWADDR)
 {
   slog(LOG_DEBUG_VV, "In Handle Client\n");
   fflush(stdout);
@@ -290,11 +351,13 @@ void handleClient(int pSock, char *pPassword, char *pHWADDR)
   socklen_t len;
   struct sockaddr_storage addr;
   #ifdef AF_INET6
-  char ipstr[INET6_ADDRSTRLEN];
+  unsigned char ipbin[INET6_ADDRSTRLEN];
   #else
-  char ipstr[INET_ADDRSTRLEN];
+  unsigned char ipbin[INET_ADDRSTRLEN];
   #endif
+  unsigned int ipbinlen;
   int port;
+  char ipstr[64];
 
   len = sizeof addr;
   getsockname(pSock, (struct sockaddr*)&addr, &len);
@@ -305,11 +368,31 @@ void handleClient(int pSock, char *pPassword, char *pHWADDR)
       struct sockaddr_in *s = (struct sockaddr_in *)&addr;
       port = ntohs(s->sin_port);
       inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
+      memcpy(ipbin, &s->sin_addr, 4);
+      ipbinlen = 4;
   } else { // AF_INET6
       slog(LOG_DEBUG_V, "Constructing ipv6 address\n");
       struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
       port = ntohs(s->sin6_port);
       inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof ipstr);
+
+      union {
+          struct sockaddr_in6 s;
+          unsigned char bin[sizeof(struct sockaddr_in6)];
+      } addr;
+      memcpy(&addr.s, &s->sin6_addr, sizeof(struct sockaddr_in6));
+
+      if(memcmp(&addr.bin[0], "\x00\x00\x00\x00" "\x00\x00\x00\x00" "\x00\x00\xff\xff", 12) == 0)
+      {
+        // its ipv4...
+        memcpy(ipbin, &addr.bin[12], 4);
+        ipbinlen = 4;
+      }
+      else
+      {
+        memcpy(ipbin, &s->sin6_addr, 16);
+        ipbinlen = 16;
+      }
   }
 
   slog(LOG_DEBUG_V, "Peer IP address: %s\n", ipstr);
@@ -332,11 +415,11 @@ void handleClient(int pSock, char *pPassword, char *pHWADDR)
     while(1 == tMoreDataNeeded)
     {
       tError = readDataFromClient(pSock, &(tConn.recv));
-      if(!tError)
+      if(!tError && strlen(tConn.recv.data) > 0)
       {
         slog(LOG_DEBUG_VV, "Finished Reading some data from client\n");
         // parse client request
-        tMoreDataNeeded = parseMessage(&tConn, ipstr, pHWADDR);
+        tMoreDataNeeded = parseMessage(&tConn, ipbin, ipbinlen, pHWADDR);
         if(1 == tMoreDataNeeded)
         {
           slog(LOG_DEBUG_VV, "\n\nNeed to read more data\n");
@@ -368,54 +451,17 @@ void handleClient(int pSock, char *pPassword, char *pHWADDR)
   fflush(stdout);
 }
 
-
-void writeDataToClient(int pSock, struct shairbuffer *pResponse)
+static void writeDataToClient(int pSock, struct shairbuffer *pResponse)
 {
   slog(LOG_DEBUG_VV, "\n----Beg Send Response Header----\n%.*s\n", pResponse->current, pResponse->data);
   send(pSock, pResponse->data, pResponse->current,0);
   slog(LOG_DEBUG_VV, "----Send Response Header----\n");
 }
 
-void convertIpToBinary(char *tSockethost, int pIsIPv6, char* pIpBinary)
-{
-  if(pIsIPv6)
-  {
-    // do something different
-    slog(LOG_INFO, " Must implement ipv6 signature portion in convertIpToBinary...sorry.\n");
-  }
-  else
-  {
-    // Takes care of ipv4 addresses like ::ffff:192.168.1.3
-    char *tStartOfV4 = strrchr(tSockethost, ':');
-    if(NULL == tStartOfV4)
-    {
-      tStartOfV4 = tSockethost;
-    }
-    else
-    {
-      tStartOfV4+=1;
-    }
-
-    char tIp[strlen(tStartOfV4)+1];
-    memset(tIp, 0, (strlen(tStartOfV4)+1));
-    strncpy(tIp, tStartOfV4, strlen(tStartOfV4));
-
-    char *tIpTokens = strtok (tIp, ".");
-
-    int tIdx = 0;
-    // if ipv4, discard prefill
-    while(tIpTokens != NULL)
-    {
-      slog(LOG_DEBUG_VV, "%s\n", tIpTokens);
-      pIpBinary[tIdx++] = atoi(tIpTokens);
-      tIpTokens = strtok(NULL, " .");
-    }
-  }
-}
-
-int readDataFromClient(int pSock, struct shairbuffer *pClientBuffer)
+static int readDataFromClient(int pSock, struct shairbuffer *pClientBuffer)
 {
   char tReadBuf[MAX_SIZE];
+  tReadBuf[0] = '\0';
 
   int tRetval = 1;
   int tEnd = -1;
@@ -451,7 +497,7 @@ int readDataFromClient(int pSock, struct shairbuffer *pClientBuffer)
       }
       else
       {
-        slog(LOG_DEBUG, "Error reading data from socket.\n");
+        slog(LOG_DEBUG, "Error reading data from socket, got: %d bytes", tRetval);
         return tRetval;
       }
   }
@@ -464,7 +510,7 @@ int readDataFromClient(int pSock, struct shairbuffer *pClientBuffer)
   return 0;
 }
 
-char *getFromBuffer(char *pBufferPtr, const char *pField, int pLenAfterField, int *pReturnSize, char *pDelims)
+static char *getFromBuffer(char *pBufferPtr, const char *pField, int pLenAfterField, int *pReturnSize, char *pDelims)
 {
   slog(LOG_DEBUG_V, "GettingFromBuffer: %s\n", pField);
   char* tFound = strstr(pBufferPtr, pField);
@@ -500,71 +546,60 @@ char *getFromBuffer(char *pBufferPtr, const char *pField, int pLenAfterField, in
   return tFound;
 }
 
-
-char *getFromHeader(char *pHeaderPtr, const char *pField, int *pReturnSize)
+static char *getFromHeader(char *pHeaderPtr, const char *pField, int *pReturnSize)
 {
   return getFromBuffer(pHeaderPtr, pField, 2, pReturnSize, "\r\n");
 }
 
-char *getFromContent(char *pContentPtr, const char* pField, int *pReturnSize)
+static char *getFromContent(char *pContentPtr, const char* pField, int *pReturnSize)
 {
   return getFromBuffer(pContentPtr, pField, 1, pReturnSize, "\r\n");
 }
 
-char *getFromSetup(char *pContentPtr, const char* pField, int *pReturnSize)
+static char *getFromSetup(char *pContentPtr, const char* pField, int *pReturnSize)
 {
   return getFromBuffer(pContentPtr, pField, 1, pReturnSize, ";\r\n");
 }
 
 // Handles compiling the Apple-Challenge, HWID, and Server IP Address
 // Into the response the airplay client is expecting.
-int buildAppleResponse(struct connection *pConn, char *pIpStr, char *pHWID)
+static int buildAppleResponse(struct connection *pConn, unsigned char *pIpBin,
+                              unsigned int pIpBinLen, char *pHWID)
 {
   // Find Apple-Challenge
   char *tResponse = NULL;
 
   int tFoundSize = 0;
   char* tFound = getFromHeader(pConn->recv.data, "Apple-Challenge", &tFoundSize);
-  
   if(tFound != NULL)
   {
     char tTrim[tFoundSize + 2];
     getTrimmed(tFound, tFoundSize, TRUE, TRUE, tTrim);
     slog(LOG_DEBUG_VV, "HeaderChallenge:  [%s] len: %d  sizeFound: %d\n", tTrim, strlen(tTrim), tFoundSize);
     int tChallengeDecodeSize = 16;
-    char *tTmp = NULL;    
     char *tChallenge = decode_base64((unsigned char *)tTrim, tFoundSize, &tChallengeDecodeSize);
     slog(LOG_DEBUG_VV, "Challenge Decode size: %d  expected 16\n", tChallengeDecodeSize);
 
-    char tIpAddress[4];
-    convertIpToBinary(pIpStr, FALSE, tIpAddress);
-    int tIpSize = 4;
-    if(FALSE)
-    {
-      // TODO - Handle/Test on IPV6
-      tIpSize = 6; // IPV6
-    }
-
-    tTmp = encode_base64((unsigned char *) tIpAddress, tIpSize);
-    slog(LOG_DEBUG_VV, "IPDATA: %s => %s\n", pIpStr, tTmp);
-    free(tTmp);
-
     int tCurSize = 0;
-    unsigned char tChalResp[32];
+    unsigned char tChalResp[38];
 
     memcpy(tChalResp, tChallenge, tChallengeDecodeSize);
     tCurSize += tChallengeDecodeSize;
     
-    memcpy(tChalResp+tCurSize, tIpAddress, tIpSize);
-    tCurSize += tIpSize;
+    memcpy(tChalResp+tCurSize, pIpBin, pIpBinLen);
+    tCurSize += pIpBinLen;
 
     memcpy(tChalResp+tCurSize, pHWID, HWID_SIZE);
     tCurSize += HWID_SIZE;
 
     int tPad = 32 - tCurSize;
-    memset(tChalResp+tCurSize, 0, tPad);
+    if (tPad > 0)
+    {
+      memset(tChalResp+tCurSize, 0, tPad);
+      tCurSize += tPad;
+    }
 
-    tTmp = encode_base64((unsigned char *)tChalResp, 32);
+    char *tTmp = encode_base64((unsigned char *)tChalResp, tCurSize);
     slog(LOG_DEBUG_VV, "Full sig: %s\n", tTmp);
     free(tTmp);
 
@@ -572,7 +607,7 @@ int buildAppleResponse(struct connection *pConn, char *pIpStr, char *pHWID)
     RSA *rsa = loadKey();  // Free RSA
     int tSize = RSA_size(rsa);
     unsigned char tTo[tSize];
-    RSA_private_encrypt(32, (unsigned char *)tChalResp, tTo, rsa, RSA_PKCS1_PADDING);
+    RSA_private_encrypt(tCurSize, (unsigned char *)tChalResp, tTo, rsa, RSA_PKCS1_PADDING);
     
     // Wrap RSA Encrypted binary in Base64 encoding
     tResponse = encode_base64(tTo, tSize);
@@ -598,7 +633,7 @@ int buildAppleResponse(struct connection *pConn, char *pIpStr, char *pHWID)
 }
 
 //parseMessage(tConn->recv.data, tConn->recv.mark, &tConn->resp, ipstr, pHWADDR, tConn->keys);
-int parseMessage(struct connection *pConn, char *pIpStr, char *pHWID)
+static int parseMessage(struct connection *pConn, unsigned char *pIpBin, unsigned int pIpBinLen, char *pHWID)
 {
   int tReturn = 0; // 0 = good, 1 = Needs More Data, -1 = close client socket.
   if(pConn->resp.data == NULL)
@@ -648,7 +683,7 @@ int parseMessage(struct connection *pConn, char *pIpStr, char *pHWID)
     
   }
 
-  if(buildAppleResponse(pConn, pIpStr, pHWID)) // need to free sig
+  if(buildAppleResponse(pConn, pIpBin, pIpBinLen, pHWID)) // need to free sig
   {
     slog(LOG_DEBUG_V, "Added AppleResponse to Apple-Challenge request\n");
   }
@@ -768,7 +803,8 @@ int parseMessage(struct connection *pConn, char *pIpStr, char *pHWID)
       }
       cleanupBuffers(pConn);
       hairtunes_init(tKeys->aeskey, tKeys->aesiv, tKeys->fmt, tControlport, tTimingport,
-                      tDataport, tRtp, tPipe, tAoDriver, tAoDeviceName, tAoDeviceId);
+                      tDataport, tRtp, tPipe, tAoDriver, tAoDeviceName, tAoDeviceId,
+                      bufferStartFill);
 
       // Quit when finished.
       slog(LOG_DEBUG, "Returned from hairtunes init....returning -1, should close out this whole side of the fork\n");
@@ -853,7 +889,7 @@ int parseMessage(struct connection *pConn, char *pIpStr, char *pHWID)
 }
 
 // Copies CSeq value from request, and adds standard header values in.
-void propogateCSeq(struct connection *pConn) //char *pRecvBuffer, struct shairbuffer *pConn->recp.data)
+static void propogateCSeq(struct connection *pConn) //char *pRecvBuffer, struct shairbuffer *pConn->recp.data)
 {
   int tSize=0;
   char *tRecPtr = getFromHeader(pConn->recv.data, "CSeq", &tSize);
@@ -877,7 +913,7 @@ void cleanupBuffers(struct connection *pConn)
   }
 }
 
-void cleanup(struct connection *pConn)
+static void cleanup(struct connection *pConn)
 {
   cleanupBuffers(pConn);
   if(pConn->hairtunes != NULL)
@@ -911,7 +947,7 @@ void cleanup(struct connection *pConn)
   }
 }
 
-int startAvahi(const char *pHWStr, const char *pServerName, int pPort)
+static int startAvahi(const char *pHWStr, const char *pServerName, int pPort)
 {
   int tMaxServerName = 25; // Something reasonable?  iPad showed 21, iphone 25
   int tPid = fork();
@@ -939,11 +975,14 @@ int startAvahi(const char *pHWStr, const char *pServerName, int pPort)
     execlp("dns-sd", "dns-sd", "-R", tName,
          "_raop._tcp", ".", tPort, "tp=UDP","sm=false","sv=false","ek=1","et=0,1",
          "cn=0,1","ch=2","ss=16","sr=44100","pw=false","vn=3","txtvers=1", NULL);
+    execlp("mDNSPublish", "mDNSPublish", tName,
+         "_raop._tcp", tPort, "tp=UDP","sm=false","sv=false","ek=1","et=0,1",
+         "cn=0,1","ch=2","ss=16","sr=44100","pw=false","vn=3","txtvers=1", NULL);
     if(errno == -1) {
             perror("error");
     }
 
-    slog(LOG_INFO, "Bad error... couldn't find or failed to run: avahi-publish-service OR dns-sd\n");
+    slog(LOG_INFO, "Bad error... couldn't find or failed to run: avahi-publish-service OR dns-sd OR mDNSPublish\n");
     exit(1);
   }
   else
@@ -953,22 +992,17 @@ int startAvahi(const char *pHWStr, const char *pServerName, int pPort)
   return tPid;
 }
 
-void printBufferInfo(struct shairbuffer *pBuf, int pLevel)
-{
-  slog(pLevel, "Buffer: [%s]  size: %d  maxchars:%d\n", pBuf->data, pBuf->current, pBuf->maxsize/sizeof(char));
-}
-
-int getAvailChars(struct shairbuffer *pBuf)
+static int getAvailChars(struct shairbuffer *pBuf)
 {
   return (pBuf->maxsize / sizeof(char)) - pBuf->current;
 }
 
-void addToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf)
+static void addToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf)
 {
   addNToShairBuffer(pBuf, pNewBuf, strlen(pNewBuf));
 }
 
-void addNToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf, int pNofNewBuf)
+static void addNToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf, int pNofNewBuf)
 {
   int tAvailChars = getAvailChars(pBuf);
   if(pNofNewBuf > tAvailChars)
@@ -992,7 +1026,7 @@ void addNToShairBuffer(struct shairbuffer *pBuf, char *pNewBuf, int pNofNewBuf)
   }
 }
 
-char *getTrimmedMalloc(char *pChar, int pSize, int pEndStr, int pAddNL)
+static char *getTrimmedMalloc(char *pChar, int pSize, int pEndStr, int pAddNL)
 {
   int tAdditionalSize = 0;
   if(pEndStr)
@@ -1004,7 +1038,7 @@ char *getTrimmedMalloc(char *pChar, int pSize, int pEndStr, int pAddNL)
 }
 
 // Must free returned ptr
-char *getTrimmed(char *pChar, int pSize, int pEndStr, int pAddNL, char *pTrimDest)
+static char *getTrimmed(char *pChar, int pSize, int pEndStr, int pAddNL, char *pTrimDest)
 {
   int tSize = pSize;
   if(pEndStr)
@@ -1029,7 +1063,7 @@ char *getTrimmed(char *pChar, int pSize, int pEndStr, int pAddNL, char *pTrimDes
   return pTrimDest;
 }
 
-void slog(int pLevel, char *pFormat, ...)
+static void slog(int pLevel, char *pFormat, ...)
 {
   #ifdef SHAIRPORT_LOG
   if(isLogEnabledFor(pLevel))
@@ -1042,7 +1076,7 @@ void slog(int pLevel, char *pFormat, ...)
   #endif
 }
 
-int isLogEnabledFor(int pLevel)
+static int isLogEnabledFor(int pLevel)
 {
   if(pLevel <= kCurrentLogLevel)
   {
@@ -1051,7 +1085,7 @@ int isLogEnabledFor(int pLevel)
   return FALSE;
 }
 
-void initConnection(struct connection *pConn, struct keyring *pKeys, 
+static void initConnection(struct connection *pConn, struct keyring *pKeys,
                     struct comms *pComms, int pSocket, char *pPassword)
 {
   pConn->hairtunes = pComms;
@@ -1075,7 +1109,7 @@ void initConnection(struct connection *pConn, struct keyring *pKeys,
   }
 }
 
-void closePipe(int *pPipe)
+static void closePipe(int *pPipe)
 {
   if(*pPipe != -1)
   {
@@ -1084,7 +1118,7 @@ void closePipe(int *pPipe)
   }
 }
 
-void initBuffer(struct shairbuffer *pBuf, int pNumChars)
+static void initBuffer(struct shairbuffer *pBuf, int pNumChars)
 {
   if(pBuf->data != NULL)
   {
@@ -1099,7 +1133,7 @@ void initBuffer(struct shairbuffer *pBuf, int pNumChars)
   memset(pBuf->data, 0, pBuf->maxsize);
 }
 
-void setKeys(struct keyring *pKeys, char *pIV, char* pAESKey, char *pFmtp)
+static void setKeys(struct keyring *pKeys, char *pIV, char* pAESKey, char *pFmtp)
 {
   if(pKeys->aesiv != NULL)
   {
@@ -1140,10 +1174,10 @@ void setKeys(struct keyring *pKeys, char *pIV, char* pAESKey, char *pFmtp)
 "17fegFPMwOII8MisYm9ZfT2Z0s5Ro3s5rkt+nvLAdfC/PYPKzTLalpGSwomSNYJcB9HNMlmhkGzc\n" \
 "1JnLYT4iyUyx6pcZBmCd8bD0iwY/FzcgNDaUmbX9+XDvRA0CgYEAkE7pIPlE71qvfJQgoA9em0gI\n" \
 "LAuE4Pu13aKiJnfft7hIjbK+5kyb3TysZvoyDnb3HOKvInK7vXbKuU4ISgxB2bB3HcYzQMGsz1qJ\n" \
-"2gG0N5hvJpzwwhbhXqFKA4zaaSrw622wDniAK5MlIE0tIAKKP4yxNGjoD2QYjhBGuhvkWKaXTyY=\n" \
+"2gG0N5hvJpzwwhbhXqFKA4zaaSrw622wDniAK5MlIE0tIAKKP4yxNGjoD2QYjhBGuhvkWKY=\n" \
 "-----END RSA PRIVATE KEY-----"
 
-RSA *loadKey()
+static RSA *loadKey(void)
 {
   BIO *tBio = BIO_new_mem_buf(AIRPORT_PRIVATE_KEY, -1);
   RSA *rsa = PEM_read_bio_RSAPrivateKey(tBio, NULL, NULL, NULL); //NULL, NULL, NULL);

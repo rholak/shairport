@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
@@ -43,7 +44,15 @@ int common_setup(struct addrinfo *pAddrInfo)
   int tSock;
   //printAddrs(pAddrInfo);
   tSock = socket(pAddrInfo->ai_family, pAddrInfo->ai_socktype, 0);
-
+#ifdef AF_INET6
+  if((tSock==-1) && (pAddrInfo->ai_family == AF_INET6) && (errno == EAFNOSUPPORT))
+  {
+    //Fallback to ipv4
+    perror("Failed to create ipv6 socket. Trying ipv4");
+    pAddrInfo->ai_family = AF_INET;
+    tSock = socket(pAddrInfo->ai_family, pAddrInfo->ai_socktype, 0);
+  }
+#endif
   return tSock;
 }
 
@@ -174,7 +183,7 @@ void delay(long pMillisecs, struct timeval *pRes)
   select(0,NULL,NULL,NULL,pRes);
 }
 
-int getCorrectedEncodeSize(int pSize)
+static int getCorrectedEncodeSize(int pSize)
 {
   if(pSize % 4 == 0)
   {
@@ -255,7 +264,7 @@ char *encode_base64(unsigned char *input, int length)
   b64 = BIO_push(b64, bmem);
 
   BIO_write(b64, input, length);
-  BIO_flush(b64);
+  (void)BIO_flush(b64);
   BIO_get_mem_ptr(b64, &bptr);
 
   char *buff = (char *)malloc(bptr->length);
